@@ -17,7 +17,7 @@ Loss            : MSE(predictions[mask], target_reps[mask])
 
 The target encoder is updated via EMA after each optimiser step, with a cosine momentum schedule from τ_base (0.996) → 1.0. The asymmetric architecture (shallow predictor + EMA target) prevents representation collapse without explicit regularisation.
 
-### Default model (7-layer, 1.47M params)
+### Default model (7-layer, 1.8M params)
 
 | Component | Value |
 |-----------|-------|
@@ -27,8 +27,20 @@ The target encoder is updated via EMA after each optimiser step, with a cosine m
 | d_ff | 512 |
 | predictor_n_layers | 2 |
 | seq_len | 512 |
-| mask_ratio | 0.15 |
-| mask_patch_size | 16 |
+| mask_ratio | 0.25 |
+| mask_patch_size | 16–256 |
+
+## Results
+
+### JEPA representations (7 layers)
+
+![JEPA UMAP](representation_umap_jepa_model.png)
+
+### BERT baseline representations (7 layers, RoPE)
+
+![BERT UMAP](representation_umap_bert_model.png)
+
+JEPA produces significantly better cluster separation than the BERT baseline across all layers, peaking at **Sil=0.61** (layer 6) vs **Sil=0.29** (BERT layer 6).
 
 ## GPU Optimisations
 
@@ -53,7 +65,7 @@ python markov_circles_timeseries.py --subspace-dim 4 --no-umap
 ### Train
 
 ```bash
-python jepa_model_gpu.py --n-layers 7 --epochs 500
+python jepa_model_gpu.py --n-layers 7 --mask-patch-max 256 --mask-ratio 0.25 --epochs 500
 ```
 
 ### Evaluate representations (UMAP + Levina-Bickel)

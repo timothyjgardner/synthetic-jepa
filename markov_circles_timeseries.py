@@ -12,16 +12,16 @@ Dynamics
 The model visits one circle at a time as a "syllable":
   1. Enter circle i at its fixed entry angle.
   2. Traverse at the circle's fixed angular velocity  ω_i = 2π / period_i.
-     Periods are linearly spaced from 40 steps (fastest) to 400 steps
-     (slowest) per revolution — a 10× speed range.
+     Periods are linearly spaced from 40 steps (fastest) to 200 steps
+     (slowest) per revolution — a 5× speed range.
   3. The number of complete revolutions K per visit is drawn so that
      K × period_i ≈ 400 steps (target from Normal(400, 100), quantised
      to whole revolutions).  This keeps dwell times near ~400 steps,
      preserves fixed entry/exit angles, and guarantees constant ω
      within each state.
   4. On exit, choose the next circle from the off-diagonal entries of a
-     sparse transition matrix (ring + shortcut connectivity, zero
-     diagonal).
+     sparse random transition matrix (2–3 heavy + 3–4 light targets
+     per circle, zero diagonal).
 
 Overlap control  (--subspace-dim)
 ---------------------------------
@@ -159,7 +159,8 @@ def create_sparse_transition_matrix(n_circles=10, seed=42):
     always completes an integer number of full revolutions on a circle
     before switching to a different one.
 
-    Structure: ring connectivity + long-range shortcut edges.
+    Structure: each circle has 2–3 heavy targets and 3–4 light targets,
+    all chosen randomly (no ring bias).
 
     Returns
     -------
@@ -169,28 +170,22 @@ def create_sparse_transition_matrix(n_circles=10, seed=42):
     rng = np.random.default_rng(seed)
     T = np.zeros((n_circles, n_circles))
 
-    # Ring neighbors
     for i in range(n_circles):
-        T[i, (i + 1) % n_circles] = 1.0
-        T[i, (i - 1) % n_circles] = 1.0
+        others = [j for j in range(n_circles) if j != i]
+        rng.shuffle(others)
 
-    # Long-range shortcut connections
-    shortcuts = [
-        (0, 5), (0, 7),
-        (1, 6), (1, 8),
-        (2, 9),
-        (3, 7),
-        (4, 8), (4, 1),
-        (5, 2),
-        (6, 0), (6, 3),
-        (7, 4),
-        (8, 1), (8, 5),
-        (9, 3), (9, 6),
-    ]
-    for i, j in shortcuts:
-        T[i, j] += rng.uniform(0.3, 0.8)
+        n_heavy = rng.integers(2, 4)   # 2 or 3 heavy targets
+        n_light = rng.integers(3, 5)   # 3 or 4 light targets
+        n_light = min(n_light, len(others) - n_heavy)
 
-    # Zero out diagonal (no self-transitions) and normalise rows
+        heavy_targets = others[:n_heavy]
+        light_targets = others[n_heavy:n_heavy + n_light]
+
+        for j in heavy_targets:
+            T[i, j] = rng.uniform(0.5, 1.0)
+        for j in light_targets:
+            T[i, j] = rng.uniform(0.05, 0.2)
+
     np.fill_diagonal(T, 0.0)
     T /= T.sum(axis=1, keepdims=True)
     return T
@@ -210,7 +205,7 @@ def generate_time_series(
     dwell_mean=400,
     dwell_std=100,
     min_period=40,
-    max_period=400,
+    max_period=200,
     subspace_dim=None,
     seed=42,
 ):
@@ -390,7 +385,7 @@ DEFAULT_CONFIG = dict(
     dwell_mean=400,
     dwell_std=100,
     min_period=40,
-    max_period=400,
+    max_period=200,
     subspace_dim=None,
     seed=42,
 )

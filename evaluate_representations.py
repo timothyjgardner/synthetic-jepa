@@ -24,6 +24,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 import torch
 import umap
+from sklearn.metrics import silhouette_score
 
 from masked_model import MaskedTimeSeriesBERT
 from estimate_dimension import levina_bickel_estimator
@@ -260,11 +261,13 @@ def main():
             layer_i = int(key.split('_')[1]) - 1
             return layer_reps[layer_i][lb_idx]
 
-    # ---- Levina-Bickel on selected layers (optional) ----
+    # ---- Levina-Bickel + Silhouette on selected layers (optional) ----
     lb_results = {}
+    sil_results = {}
     if not args.no_lb:
         lb_ks = [10, 30, 100]
         lb_idx = rng.choice(n_used, min(args.lb_points, n_used), replace=False)
+        lb_states = states_used[lb_idx]
         print(f"\nLevina-Bickel on {len(lb_idx)} points:")
 
         for key in selected_keys:
@@ -278,6 +281,14 @@ def main():
             label = key.replace('_', ' ').title()
             print(f"  {label} ({rep_lb.shape[1]}D):  {lb_str}")
 
+        print(f"\nSilhouette scores on {len(lb_idx)} points (high-D):")
+        for key in selected_keys:
+            rep_lb = get_lb_data(key)
+            sil = silhouette_score(rep_lb, lb_states, sample_size=None)
+            sil_results[key] = sil
+            label = key.replace('_', ' ').title()
+            print(f"  {label} ({rep_lb.shape[1]}D):  {sil:.4f}")
+
     # ---- UMAP for selected layers ----
     panels = [get_panel_data(key) for key in selected_keys]
     n_panels = len(panels)
@@ -289,11 +300,16 @@ def main():
         axes = np.array([axes])
     axes = np.atleast_1d(axes).flatten()
 
+    sil_umap_results = {}
     for ax_i, (title, data, lb_key) in enumerate(panels):
         print(f"Computing UMAP for {title}...")
         reducer = umap.UMAP(n_neighbors=args.umap_neighbors, min_dist=0.3,
                             metric='euclidean', random_state=42)
         embedding = reducer.fit_transform(data)
+
+        # Silhouette score in 2D UMAP space
+        sil_2d = silhouette_score(embedding, states_sub)
+        sil_umap_results[lb_key] = sil_2d
 
         ax = axes[ax_i]
         sc = ax.scatter(embedding[:, 0], embedding[:, 1], c=states_sub,
@@ -301,13 +317,22 @@ def main():
         ax.set_xlabel('UMAP 1')
         ax.set_ylabel('UMAP 2')
 
-        # Add LB info to title if available
+        # Add LB and silhouette (UMAP 2D) info to title
+        subtitle_parts = []
         if lb_key in lb_results:
             lb30 = lb_results[lb_key].get(30, None)
             if lb30 is not None:
-                title += f'  (LB k=30: {lb30:.1f})'
+                subtitle_parts.append(f'LB={lb30:.1f}')
+        subtitle_parts.append(f'Sil={sil_2d:.3f}')
+        title += f'  ({", ".join(subtitle_parts)})'
         ax.set_title(title, fontsize=12)
         ax.grid(True, alpha=0.2)
+
+    print(f"\nSilhouette scores in UMAP 2D space:")
+    for key in selected_keys:
+        if key in sil_umap_results:
+            label = key.replace('_', ' ').title()
+            print(f"  {label}:  {sil_umap_results[key]:.4f}")
 
     # Colourbar on the last used panel
     cbar = plt.colorbar(sc, ax=axes[len(panels) - 1], label='Circle index')
@@ -322,7 +347,8 @@ def main():
                  fontweight='bold', y=1.02)
     plt.tight_layout()
 
-    fname = 'representation_umap.png'
+    ckpt_stem = Path(args.checkpoint).stem
+    fname = f'representation_umap_{ckpt_stem}.png'
     plt.savefig(fname, dpi=150, bbox_inches='tight')
     plt.close()
     print(f"\nSaved {fname}")
