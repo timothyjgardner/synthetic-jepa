@@ -36,11 +36,11 @@ The target encoder is updated via EMA after each optimiser step, with a cosine m
 
 ![JEPA UMAP](representation_umap_jepa_model.png)
 
-### BERT baseline representations (7 layers, RoPE)
+### BERT baseline representations (7 layers, RoPE, matched masks)
 
 ![BERT UMAP](representation_umap_bert_model.png)
 
-JEPA produces significantly better cluster separation than the BERT baseline across all layers, peaking at **Sil=0.61** (layer 6) vs **Sil=0.29** (BERT layer 6).
+Both models use identical masking (patches 16–256, 25% ratio), 7 RoPE encoder layers, and the same dataset. JEPA produces significantly better cluster separation, peaking at **Sil=0.61** (layer 6) vs **Sil=0.12** (BERT layer 5).
 
 ## GPU Optimisations
 
