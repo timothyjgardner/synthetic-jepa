@@ -207,6 +207,8 @@ def generate_time_series(
     min_period=40,
     max_period=200,
     subspace_dim=None,
+    drift=False,
+    drift_rate=0.5,
     seed=42,
 ):
     """
@@ -249,6 +251,13 @@ def generate_time_series(
         Dimension of the subspace from which circle planes are drawn.
         Controls geometric overlap (see ``create_circles`` docstring).
         None or ambient_dim = no overlap; 2 = maximum overlap.
+    drift : bool
+        If True, even-numbered circles (0, 2, 4, ...) gradually tilt
+        their 2D plane during each visit (syllable), resetting to
+        the original orientation on each new visit.
+    drift_rate : float
+        Maximum tilt angle in radians over one syllable.
+        Default 0.5 rad ≈ 29°.
     seed : int
         Random seed for reproducibility.
 
@@ -279,6 +288,31 @@ def generate_time_series(
     # Fixed entry angle for each circle
     entry_angles = rng.uniform(0, 2 * np.pi, n_circles)
 
+    # Drift setup: for even circles, compute a tilt axis orthogonal to the plane
+    drift_axes = {}
+    if drift:
+        for i in range(0, n_circles, 2):
+            v1, v2 = planes[i]
+            d = rng.standard_normal(ambient_dim)
+            d -= d.dot(v1) * v1
+            d -= d.dot(v2) * v2
+            d /= np.linalg.norm(d)
+            drift_axes[i] = d
+
+    def _get_plane(circle_idx, step_in_syllable, syllable_len):
+        """Return the (possibly drifted) plane for a circle at a given step
+        within the current syllable. Drift resets at each new visit."""
+        v1, v2 = planes[circle_idx]
+        if not drift or circle_idx not in drift_axes:
+            return v1, v2
+        alpha = drift_rate * (step_in_syllable / max(1, syllable_len))
+        d = drift_axes[circle_idx]
+        v1_new = np.cos(alpha) * v1 + np.sin(alpha) * d
+        v1_new /= np.linalg.norm(v1_new)
+        v2_new = v2 - v2.dot(v1_new) * v1_new
+        v2_new /= np.linalg.norm(v2_new)
+        return v1_new, v2_new
+
     # Allocate output arrays
     X = np.zeros((n_steps, ambient_dim))
     states = np.zeros(n_steps, dtype=int)
@@ -303,10 +337,11 @@ def generate_time_series(
             states[t] = current_circle
             thetas[t] = angle % (2 * np.pi)
 
+            plane = _get_plane(current_circle, s, dwell)
             pos = point_on_circle(
                 thetas[t],
                 radii[current_circle],
-                planes[current_circle],
+                plane,
                 centers[current_circle],
             )
             X[t] = pos + rng.normal(0, noise_std, ambient_dim)
@@ -387,6 +422,8 @@ DEFAULT_CONFIG = dict(
     min_period=40,
     max_period=200,
     subspace_dim=None,
+    drift=False,
+    drift_rate=0.5,
     seed=42,
 )
 
@@ -561,6 +598,20 @@ def main(run_umap=True):
         ax_top.set_xlim(t0, t1)
         ax_top.set_yticks([])
         ax_top.set_ylabel('State', fontsize=10)
+
+        # Label each syllable segment with circle index and drift marker
+        seg_start = t0
+        for t in range(t0 + 1, t1 + 1):
+            if t == t1 or states[t] != states[t - 1]:
+                seg_mid = (seg_start + t) / 2
+                ci = states[seg_start]
+                is_drift = config.get('drift', False) and ci % 2 == 0
+                label = f'{ci}D' if is_drift else str(ci)
+                ax_top.text(seg_mid, 0.5, label, ha='center', va='center',
+                            fontsize=7, fontweight='bold', color='white',
+                            transform=ax_top.get_xaxis_transform())
+                seg_start = t
+
         ax_top.set_title(f'Sample window  t = {t0} … {t1}  '
                          f'({window} steps)', fontsize=12)
         plt.setp(ax_top.get_xticklabels(), visible=False)
@@ -639,9 +690,18 @@ if __name__ == '__main__':
     parser.add_argument('--n-steps', type=int, default=None,
                         help='Total time steps to generate '
                              '(default: 100000)')
+    parser.add_argument('--drift', action='store_true',
+                        help='Enable gradual plane tilt for even-numbered '
+                             'circles (non-stationary geometry)')
+    parser.add_argument('--drift-rate', type=float, default=0.5,
+                        help='Max tilt angle in radians over the full '
+                             'time series (default: 0.5 ≈ 29°)')
     args = parser.parse_args()
     if args.subspace_dim is not None:
         DEFAULT_CONFIG['subspace_dim'] = args.subspace_dim
     if args.n_steps is not None:
         DEFAULT_CONFIG['n_steps'] = args.n_steps
+    if args.drift:
+        DEFAULT_CONFIG['drift'] = True
+        DEFAULT_CONFIG['drift_rate'] = args.drift_rate
     main(run_umap=not args.no_umap)
