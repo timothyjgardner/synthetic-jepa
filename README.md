@@ -26,7 +26,7 @@ The target encoder is updated via EMA after each optimiser step, with a cosine m
 | n_layers | 7 |
 | d_ff | 512 |
 | predictor_n_layers | 2 |
-| seq_len | 512 |
+| seq_len | 2048 |
 | mask_ratio | 0.25 |
 | mask_patch_size | 16–256 |
 
@@ -38,11 +38,25 @@ The synthetic dataset consists of 10 circles embedded in 20D ambient space with 
 
 ## Results
 
-### JEPA representations (7 layers, 3000 epochs, drift dataset)
+Both models trained for 3000 epochs on the drift dataset (`--drift --drift-rate 6.283`), seq_len=2048, mask patches 16–256 at 25% ratio.
+
+### JEPA representations (7 layers)
 
 ![JEPA UMAP](representation_umap_jepa_model.png)
 
-Trained on the drift dataset (`--drift --drift-rate 6.283`, one full plane rotation per syllable). JEPA achieves strong cluster separation across layers, peaking at **Sil=0.73** (layer 7) after 3000 epochs.
+### BERT baseline representations (7 layers, RoPE)
+
+![BERT UMAP](representation_umap_bert_model.png)
+
+| Layer | JEPA Sil | BERT Sil |
+|-------|----------|----------|
+| Input | -0.088 | -0.088 |
+| Layer 4 | 0.599 | 0.337 |
+| Layer 5 | 0.651 | 0.466 |
+| Layer 6 | 0.668 | 0.566 |
+| Layer 7 | **0.714** | **0.728** |
+
+JEPA learns better-separated representations in earlier layers, while BERT catches up at the final layer with long context (2048 steps).
 
 ## GPU Optimisations
 
@@ -71,7 +85,7 @@ python markov_circles_timeseries.py --subspace-dim 4 --drift --drift-rate 6.283 
 ### Train
 
 ```bash
-python jepa_model_gpu.py --n-layers 7 --mask-patch-max 256 --mask-ratio 0.25 --epochs 3000
+python jepa_model_gpu.py --n-layers 7 --mask-patch-max 256 --mask-ratio 0.25 --seq-len 2048 --epochs 3000
 ```
 
 ### Evaluate representations (UMAP + Levina-Bickel)
