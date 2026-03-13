@@ -131,6 +131,7 @@ def load_model(checkpoint_path, device):
             dropout=0.0,
             max_len=args['seq_len'] + 64,
             predictor_n_layers=args.get('predictor_n_layers', 2),
+            bottleneck_dim=args.get('bottleneck_dim', 0),
         ).to(device)
         model.load_state_dict(ckpt['model_state_dict'])
         model.eval()

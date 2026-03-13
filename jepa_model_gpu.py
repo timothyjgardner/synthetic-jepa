@@ -197,12 +197,14 @@ class JEPATimeSeriesModel(nn.Module):
         dropout=0.1,
         max_len=2048,
         predictor_n_layers=2,
+        bottleneck_dim=0,
     ):
         super().__init__()
         self.feature_dim = feature_dim
         self.d_model = d_model
         self.n_heads = n_heads
         self.n_layers = n_layers
+        self.bottleneck_dim = bottleneck_dim
 
         # Learnable mask token in observation space (before projection)
         self.mask_token = nn.Parameter(torch.randn(feature_dim))
@@ -217,6 +219,26 @@ class JEPATimeSeriesModel(nn.Module):
         self.target_encoder.load_state_dict(self.context_encoder.state_dict())
         for p in self.target_encoder.parameters():
             p.requires_grad = False
+
+        # Information bottleneck (applied to both encoder paths)
+        if bottleneck_dim > 0:
+            self.context_bottleneck = nn.Sequential(
+                nn.Linear(d_model, bottleneck_dim),
+                nn.ReLU(),
+                nn.Linear(bottleneck_dim, d_model),
+            )
+            self.target_bottleneck = nn.Sequential(
+                nn.Linear(d_model, bottleneck_dim),
+                nn.ReLU(),
+                nn.Linear(bottleneck_dim, d_model),
+            )
+            self.target_bottleneck.load_state_dict(
+                self.context_bottleneck.state_dict())
+            for p in self.target_bottleneck.parameters():
+                p.requires_grad = False
+        else:
+            self.context_bottleneck = None
+            self.target_bottleneck = None
 
         # Predictor (lightweight — deliberately shallower than the encoder)
         self.predictor = JEPAPredictor(
@@ -238,10 +260,14 @@ class JEPATimeSeriesModel(nn.Module):
         mask_expanded = mask.unsqueeze(-1)
         x_masked = torch.where(mask_expanded, self.mask_token, x)
         context_reps = self.context_encoder(x_masked)
+        if self.context_bottleneck is not None:
+            context_reps = self.context_bottleneck(context_reps)
 
         # Target path: full input, no gradients
         with torch.no_grad():
             target_reps = self.target_encoder(x)
+            if self.target_bottleneck is not None:
+                target_reps = self.target_bottleneck(target_reps)
 
         # Predictor: map context reps → predicted target reps at masked positions
         pred_reps = self.predictor(context_reps, mask)
@@ -254,18 +280,29 @@ class JEPATimeSeriesModel(nn.Module):
         for p_ctx, p_tgt in zip(self.context_encoder.parameters(),
                                 self.target_encoder.parameters()):
             p_tgt.data.mul_(momentum).add_(p_ctx.data, alpha=1.0 - momentum)
+        if self.context_bottleneck is not None:
+            for p_ctx, p_tgt in zip(self.context_bottleneck.parameters(),
+                                    self.target_bottleneck.parameters()):
+                p_tgt.data.mul_(momentum).add_(p_ctx.data, alpha=1.0 - momentum)
 
     @torch.no_grad()
     def encode(self, x):
         """Run input through the target encoder (no masking) and return
         per-layer representations.  Compatible with evaluate_representations.py.
 
+        When a bottleneck is active, the final layer's output is passed
+        through the target bottleneck so UMAP shows the compressed
+        representations.
+
         Returns
         -------
         layer_outputs : list of (batch, seq_len, d_model) tensors,
             one per transformer layer.
         """
-        return self.target_encoder.forward_layers(x)
+        outputs = self.target_encoder.forward_layers(x)
+        if self.target_bottleneck is not None:
+            outputs[-1] = self.target_bottleneck(outputs[-1])
+        return outputs
 
 
 # ---------------------------------------------------------------------------
@@ -486,11 +523,17 @@ def main():
                         help='Use region-level loss: average reps over each '
                              'contiguous masked region before computing MSE. '
                              'Encourages concept-level representations.')
+    # Information bottleneck
+    parser.add_argument('--bottleneck-dim', type=int, default=0,
+                        help='If >0, add an information bottleneck (linear → '
+                             'ReLU → linear) after both encoders that '
+                             'compresses d_model through this dimension. '
+                             'Forces the model to retain only salient features.')
     # Training
-    parser.add_argument('--batch-size', type=int, default=512)
+    parser.add_argument('--batch-size', type=int, default=128)
     parser.add_argument('--lr', type=float, default=3e-4)
     parser.add_argument('--warmup-epochs', type=int, default=20)
-    parser.add_argument('--epochs', type=int, default=500)
+    parser.add_argument('--epochs', type=int, default=1000)
     parser.add_argument('--val-fraction', type=float, default=0.1)
     parser.add_argument('--num-workers', type=int, default=4)
     # GPU options
@@ -598,14 +641,17 @@ def main():
         dropout=args.dropout,
         max_len=args.seq_len + 64,
         predictor_n_layers=args.predictor_n_layers,
+        bottleneck_dim=args.bottleneck_dim,
     ).to(device)
 
     n_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     n_total = sum(p.numel() for p in model.parameters())
+    bn_str = (f", bottleneck={args.bottleneck_dim}"
+              if args.bottleneck_dim > 0 else "")
     print(f"Model: {n_trainable:,} trainable params, "
           f"{n_total:,} total  "
           f"(encoder={args.n_layers}L, predictor={args.predictor_n_layers}L, "
-          f"d_model={args.d_model}, heads={args.n_heads})")
+          f"d_model={args.d_model}, heads={args.n_heads}{bn_str})")
 
     # ---- torch.compile ----
     if not args.no_compile and device.type == 'cuda':
