@@ -12,12 +12,36 @@ from pathlib import Path
 
 import numpy as np
 import matplotlib.pyplot as plt
-from scipy.spatial.distance import cdist
+import torch
+
+
+def _gpu_knn_dists(X_np, k, batch_size=2048):
+    """Batched k-NN distances on GPU using PyTorch.
+
+    Only returns distances (not indices) since Levina-Bickel doesn't need them.
+    Falls back to CPU if CUDA is unavailable.
+    """
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    X = torch.from_numpy(np.ascontiguousarray(X_np)).float().to(device)
+    n = X.shape[0]
+    all_dists = torch.zeros(n, k, device=device)
+
+    for start in range(0, n, batch_size):
+        end = min(start + batch_size, n)
+        dists = torch.cdist(X[start:end], X)
+        dists[:, start:end].fill_diagonal_(float('inf'))
+        topk_d, _ = dists.topk(k, dim=1, largest=False)
+        all_dists[start:end] = topk_d
+
+    return all_dists.cpu().numpy()
 
 
 def levina_bickel_estimator(X, k):
     """
     Levina-Bickel MLE intrinsic dimension estimator.
+
+    Uses GPU-accelerated k-NN to avoid computing the full O(n^2) distance
+    matrix on CPU.
 
     Returns
     -------
@@ -27,18 +51,18 @@ def levina_bickel_estimator(X, k):
         Per-point estimates.
     """
     n = X.shape[0]
-    distances = cdist(X, X)
-    m_hat_per_point = np.full(n, np.nan)
+    knn_dists = _gpu_knn_dists(X.astype(np.float32), k)
 
-    for i in range(n):
-        dists = np.sort(distances[i, :])[1:k + 1]
-        T_k = dists[-1]
-        if T_k < 1e-12:
-            continue
-        log_ratios = np.log(T_k / dists[:-1])
-        mean_lr = np.mean(log_ratios)
-        if mean_lr > 1e-10:
-            m_hat_per_point[i] = 1.0 / mean_lr
+    T_k = knn_dists[:, -1]
+    valid = T_k > 1e-12
+    log_ratios = np.log(
+        T_k[valid, np.newaxis] / knn_dists[valid, :-1])
+    mean_lr = log_ratios.mean(axis=1)
+
+    m_hat_per_point = np.full(n, np.nan)
+    safe = mean_lr > 1e-10
+    idx_valid = np.where(valid)[0]
+    m_hat_per_point[idx_valid[safe]] = 1.0 / mean_lr[safe]
 
     return np.nanmean(m_hat_per_point), m_hat_per_point
 

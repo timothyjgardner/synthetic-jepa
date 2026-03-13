@@ -46,6 +46,31 @@ from dataset import SyntheticSongDataset
 from masked_model_gpu import RoPETransformerEncoderLayer
 
 
+class GPUPreloadedDataset(torch.utils.data.Dataset):
+    """Wraps a SyntheticSongDataset with all window data resident on GPU.
+
+    Masks are still generated on CPU each call (random per epoch).
+    """
+
+    def __init__(self, base_ds, indices, device):
+        self._mask_fn = base_ds._generate_mask
+        self.seq_len = base_ds.seq_len
+        xs, states = [], []
+        for i in indices:
+            x, s, _ = base_ds[i]
+            xs.append(x)
+            states.append(s)
+        self.x = torch.stack(xs).to(device)
+        self.states = torch.stack(states).to(device)
+
+    def __len__(self):
+        return self.x.shape[0]
+
+    def __getitem__(self, idx):
+        mask = torch.from_numpy(self._mask_fn(idx))
+        return self.x[idx], self.states[idx], mask.to(self.x.device)
+
+
 # ---------------------------------------------------------------------------
 # Encoder backbone  (shared architecture for context & target)
 # ---------------------------------------------------------------------------
@@ -256,6 +281,44 @@ def jepa_loss(pred_reps, target_reps, mask):
     return ((pred_reps - target_reps) ** 2 * mask_expanded).sum() / n_masked
 
 
+def jepa_loss_region(pred_reps, target_reps, mask):
+    """Region-level MSE: average reps over each contiguous masked region,
+    then compute MSE between region-level predictions and targets.
+
+    Encourages concept-level representations by discarding within-region
+    positional detail — the model only needs to predict a summary of
+    the masked region, not reconstruct each timestep.
+    """
+    batch_size, seq_len, d_model = pred_reps.shape
+    total_loss = torch.tensor(0.0, device=pred_reps.device)
+    n_regions = 0
+
+    for b in range(batch_size):
+        m = mask[b]  # (seq_len,)
+        if not m.any():
+            continue
+
+        # Find contiguous masked regions via diff
+        padded = torch.cat([
+            torch.zeros(1, device=m.device, dtype=m.dtype),
+            m.to(torch.int8),
+            torch.zeros(1, device=m.device, dtype=m.dtype),
+        ])
+        diff = padded[1:] - padded[:-1]
+        starts = (diff == 1).nonzero(as_tuple=True)[0]
+        ends = (diff == -1).nonzero(as_tuple=True)[0]
+
+        for s, e in zip(starts, ends):
+            pred_region = pred_reps[b, s:e].mean(dim=0)
+            tgt_region = target_reps[b, s:e].mean(dim=0)
+            total_loss = total_loss + (pred_region - tgt_region).pow(2).mean()
+            n_regions += 1
+
+    if n_regions == 0:
+        return torch.tensor(0.0, device=pred_reps.device)
+    return total_loss / n_regions
+
+
 # ---------------------------------------------------------------------------
 # EMA momentum schedule
 # ---------------------------------------------------------------------------
@@ -271,7 +334,7 @@ def momentum_schedule(epoch, n_epochs, base_momentum=0.996):
 # ---------------------------------------------------------------------------
 
 def train_one_epoch(model, loader, optimizer, scaler, device, amp_dtype,
-                    momentum):
+                    momentum, loss_fn=jepa_loss):
     """One training epoch with mixed precision and per-step EMA updates."""
     model.train()
     total_loss = 0.0
@@ -283,7 +346,7 @@ def train_one_epoch(model, loader, optimizer, scaler, device, amp_dtype,
 
         with torch.autocast(device_type='cuda', dtype=amp_dtype):
             pred_reps, target_reps = model(x, mask)
-            loss = jepa_loss(pred_reps, target_reps, mask)
+            loss = loss_fn(pred_reps, target_reps, mask)
 
         optimizer.zero_grad(set_to_none=True)
         scaler.scale(loss).backward()
@@ -304,7 +367,7 @@ def train_one_epoch(model, loader, optimizer, scaler, device, amp_dtype,
 
 
 @torch.no_grad()
-def evaluate(model, loader, device, amp_dtype):
+def evaluate(model, loader, device, amp_dtype, loss_fn=jepa_loss):
     """Evaluation: returns (loss, cosine_similarity, target_std)."""
     model.eval()
     total_loss = 0.0
@@ -318,7 +381,7 @@ def evaluate(model, loader, device, amp_dtype):
 
         with torch.autocast(device_type='cuda', dtype=amp_dtype):
             pred_reps, target_reps = model(x, mask)
-            loss = jepa_loss(pred_reps, target_reps, mask)
+            loss = loss_fn(pred_reps, target_reps, mask)
 
         # Cosine similarity at masked positions
         mask_flat = mask.unsqueeze(-1).expand_as(pred_reps)
@@ -402,8 +465,8 @@ def main():
     parser.add_argument('--stride', type=int, default=128)
     parser.add_argument('--mask-ratio', type=float, default=0.15)
     parser.add_argument('--mask-patch-size', type=int, default=16)
-    parser.add_argument('--mask-patch-min', type=int, default=None)
-    parser.add_argument('--mask-patch-max', type=int, default=None)
+    parser.add_argument('--mask-patch-min', type=int, default=16)
+    parser.add_argument('--mask-patch-max', type=int, default=256)
     # Model (encoder)
     parser.add_argument('--d-model', type=int, default=128)
     parser.add_argument('--n-heads', type=int, default=4)
@@ -418,8 +481,13 @@ def main():
     # EMA
     parser.add_argument('--ema-base', type=float, default=0.996,
                         help='Base EMA momentum (annealed to 1.0 via cosine)')
+    # Loss
+    parser.add_argument('--region-level', action='store_true',
+                        help='Use region-level loss: average reps over each '
+                             'contiguous masked region before computing MSE. '
+                             'Encourages concept-level representations.')
     # Training
-    parser.add_argument('--batch-size', type=int, default=128)
+    parser.add_argument('--batch-size', type=int, default=512)
     parser.add_argument('--lr', type=float, default=3e-4)
     parser.add_argument('--warmup-epochs', type=int, default=20)
     parser.add_argument('--epochs', type=int, default=500)
@@ -479,22 +547,38 @@ def main():
 
     n_val = max(1, int(len(full_ds) * args.val_fraction))
     n_train = len(full_ds) - n_val
-    train_ds, val_ds = random_split(
+    split = random_split(
         full_ds, [n_train, n_val],
         generator=torch.Generator().manual_seed(args.seed),
     )
 
-    use_persistent = args.num_workers > 0
-    train_loader = DataLoader(
-        train_ds, batch_size=args.batch_size, shuffle=True,
-        num_workers=args.num_workers, pin_memory=True,
-        persistent_workers=use_persistent,
-    )
-    val_loader = DataLoader(
-        val_ds, batch_size=args.batch_size, shuffle=False,
-        num_workers=args.num_workers, pin_memory=True,
-        persistent_workers=use_persistent,
-    )
+    if device.type == 'cuda':
+        print("Preloading dataset to GPU...")
+        train_ds = GPUPreloadedDataset(full_ds, split[0].indices, device)
+        val_ds = GPUPreloadedDataset(full_ds, split[1].indices, device)
+        gpu_mb = (train_ds.x.nbytes + val_ds.x.nbytes) / 1e6
+        print(f"  Preloaded {gpu_mb:.1f} MB to GPU")
+        train_loader = DataLoader(
+            train_ds, batch_size=args.batch_size, shuffle=True,
+            num_workers=0, pin_memory=False,
+        )
+        val_loader = DataLoader(
+            val_ds, batch_size=args.batch_size, shuffle=False,
+            num_workers=0, pin_memory=False,
+        )
+    else:
+        train_ds, val_ds = split
+        use_persistent = args.num_workers > 0
+        train_loader = DataLoader(
+            train_ds, batch_size=args.batch_size, shuffle=True,
+            num_workers=args.num_workers, pin_memory=True,
+            persistent_workers=use_persistent,
+        )
+        val_loader = DataLoader(
+            val_ds, batch_size=args.batch_size, shuffle=False,
+            num_workers=args.num_workers, pin_memory=True,
+            persistent_workers=use_persistent,
+        )
 
     print(f"Dataset: {len(full_ds)} windows  "
           f"(train={n_train}, val={n_val})")
@@ -502,8 +586,7 @@ def main():
           f"feature_dim={full_ds.feature_dim}")
     print(f"  mask_ratio={args.mask_ratio}, "
           f"patch_size={full_ds.mask_patch_min}-{full_ds.mask_patch_max}")
-    print(f"  batch_size={args.batch_size}, "
-          f"num_workers={args.num_workers}")
+    print(f"  batch_size={args.batch_size}")
 
     # ---- Model ----
     model = JEPATimeSeriesModel(
@@ -550,8 +633,9 @@ def main():
                        for k, v in state_dict.items()}
             raw.load_state_dict(cleaned)
 
+        eval_loss_fn = jepa_loss_region if args.region_level else jepa_loss
         val_loss, cos_sim, tgt_std = evaluate(
-            model, val_loader, device, amp_dtype)
+            model, val_loader, device, amp_dtype, loss_fn=eval_loss_fn)
         print(f"\nVal JEPA Loss: {val_loss:.4f}")
         print(f"Cosine Similarity: {cos_sim:.4f}")
         print(f"Target Repr Std: {tgt_std:.4f}")
@@ -575,6 +659,14 @@ def main():
         milestones=[args.warmup_epochs],
     )
 
+    # ---- Loss function ----
+    if args.region_level:
+        loss_fn = jepa_loss_region
+        print("Loss: region-level (concept-level representations)")
+    else:
+        loss_fn = jepa_loss
+        print("Loss: per-timestep")
+
     # ---- Training loop ----
     best_val = float('inf')
     train_losses, val_losses, cos_sims, lrs = [], [], [], []
@@ -593,9 +685,10 @@ def main():
 
         mom = momentum_schedule(epoch, args.epochs, args.ema_base)
         train_loss = train_one_epoch(
-            model, train_loader, optimizer, scaler, device, amp_dtype, mom)
+            model, train_loader, optimizer, scaler, device, amp_dtype, mom,
+            loss_fn=loss_fn)
         val_loss, cos_sim, tgt_std = evaluate(
-            model, val_loader, device, amp_dtype)
+            model, val_loader, device, amp_dtype, loss_fn=loss_fn)
 
         elapsed = time.perf_counter() - t0
         lr = optimizer.param_groups[0]['lr']

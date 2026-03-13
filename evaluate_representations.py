@@ -18,16 +18,100 @@ Usage
 
 import argparse
 import json
+import time
 from pathlib import Path
 
 import numpy as np
 import matplotlib.pyplot as plt
 import torch
 import umap
-from sklearn.metrics import silhouette_score
 
 from masked_model import MaskedTimeSeriesBERT
 from estimate_dimension import levina_bickel_estimator
+
+
+def gpu_silhouette_score(X_np, labels, batch_size=2048):
+    """GPU-accelerated silhouette score using batched pairwise distances.
+
+    Computes the mean silhouette coefficient: for each point, measures how
+    similar it is to its own cluster (a) vs the nearest other cluster (b),
+    returning mean((b - a) / max(a, b)).
+    """
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    X = torch.from_numpy(np.ascontiguousarray(X_np)).float().to(device)
+    labels_t = torch.from_numpy(np.asarray(labels)).long().to(device)
+    n = X.shape[0]
+    unique_labels = torch.unique(labels_t)
+    n_clusters = unique_labels.shape[0]
+
+    if n_clusters < 2:
+        return 0.0
+
+    cluster_masks = labels_t.unsqueeze(0) == unique_labels.unsqueeze(1)  # (C, n)
+    cluster_sizes = cluster_masks.sum(dim=1).float()  # (C,)
+
+    a_vals = torch.zeros(n, device=device)
+    b_vals = torch.full((n,), float('inf'), device=device)
+
+    for start in range(0, n, batch_size):
+        end = min(start + batch_size, n)
+        dists = torch.cdist(X[start:end], X)  # (batch, n)
+        batch_labels = labels_t[start:end]  # (batch,)
+
+        for ci, cl in enumerate(unique_labels):
+            mask_c = cluster_masks[ci]  # (n,) bool
+            sum_dists = (dists * mask_c.unsqueeze(0).float()).sum(dim=1)  # (batch,)
+            count = cluster_sizes[ci]
+
+            is_own = (batch_labels == cl)
+
+            own_mean = sum_dists / (count - 1).clamp(min=1)
+            a_vals[start:end] = torch.where(is_own, own_mean, a_vals[start:end])
+
+            other_mean = sum_dists / count.clamp(min=1)
+            cur_b = b_vals[start:end]
+            b_vals[start:end] = torch.where(
+                ~is_own & (other_mean < cur_b), other_mean, cur_b)
+
+    s = (b_vals - a_vals) / torch.max(a_vals, b_vals).clamp(min=1e-10)
+    return s.mean().item()
+
+
+def gpu_knn(X_np, k, batch_size=2048):
+    """Batched k-NN on GPU using PyTorch (from gpu_spectral_clustering).
+
+    Returns (distances, indices) each of shape (n, k).
+    Falls back to CPU if CUDA is unavailable.
+    """
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    X = torch.from_numpy(np.ascontiguousarray(X_np)).float().to(device)
+    n = X.shape[0]
+    all_dists = torch.zeros(n, k, device=device)
+    all_idx = torch.zeros(n, k, dtype=torch.long, device=device)
+
+    for start in range(0, n, batch_size):
+        end = min(start + batch_size, n)
+        dists = torch.cdist(X[start:end], X)
+        dists[:, start:end].fill_diagonal_(float('inf'))
+        topk_d, topk_i = dists.topk(k, dim=1, largest=False)
+        all_dists[start:end] = topk_d
+        all_idx[start:end] = topk_i
+
+    return all_dists.cpu().numpy(), all_idx.cpu().numpy()
+
+
+def _fit_umap(panel_args):
+    """Worker: runs UMAP fit_transform for one panel (module-level for pickling)."""
+    title, data, lb_key, n_neighbors, pre = panel_args
+    if pre is not None:
+        knn_indices, knn_dists = pre
+        reducer = umap.UMAP(
+            n_neighbors=n_neighbors, min_dist=0.3,
+            precomputed_knn=(knn_indices, knn_dists, None))
+    else:
+        reducer = umap.UMAP(
+            n_neighbors=n_neighbors, min_dist=0.3, metric='euclidean')
+    return reducer.fit_transform(data)
 
 
 def load_model(checkpoint_path, device):
@@ -142,6 +226,8 @@ def main():
                         help='UMAP n_neighbors parameter')
     parser.add_argument('--no-lb', action='store_true',
                         help='Skip Levina-Bickel dimension estimates')
+    parser.add_argument('--no-sil', action='store_true',
+                        help='Skip silhouette score computation')
     parser.add_argument('--lb-points', type=int, default=2000,
                         help='Points to subsample for Levina-Bickel')
     parser.add_argument('--layers', type=str, default=None,
@@ -281,13 +367,14 @@ def main():
             label = key.replace('_', ' ').title()
             print(f"  {label} ({rep_lb.shape[1]}D):  {lb_str}")
 
-        print(f"\nSilhouette scores on {len(lb_idx)} points (high-D):")
-        for key in selected_keys:
-            rep_lb = get_lb_data(key)
-            sil = silhouette_score(rep_lb, lb_states, sample_size=None)
-            sil_results[key] = sil
-            label = key.replace('_', ' ').title()
-            print(f"  {label} ({rep_lb.shape[1]}D):  {sil:.4f}")
+        if not args.no_sil:
+            print(f"\nSilhouette scores on {len(lb_idx)} points (high-D):")
+            for key in selected_keys:
+                rep_lb = get_lb_data(key)
+                sil = gpu_silhouette_score(rep_lb, lb_states)
+                sil_results[key] = sil
+                label = key.replace('_', ' ').title()
+                print(f"  {label} ({rep_lb.shape[1]}D):  {sil:.4f}")
 
     # ---- UMAP for selected layers ----
     panels = [get_panel_data(key) for key in selected_keys]
@@ -295,6 +382,20 @@ def main():
     n_cols = min(n_panels, 3)
     n_rows = (n_panels + n_cols - 1) // n_cols
 
+    use_gpu_knn = torch.cuda.is_available()
+
+    # Phase 1: GPU k-NN for all panels (sequential, fast on GPU)
+    precomputed = {}
+    if use_gpu_knn:
+        print(f"\nComputing GPU k-NN for {n_panels} panels...")
+        t_knn = time.perf_counter()
+        for title, data, lb_key in panels:
+            knn_dists, knn_indices = gpu_knn(
+                data, k=args.umap_neighbors, batch_size=2048)
+            precomputed[lb_key] = (knn_indices, knn_dists)
+        print(f"  All k-NN done in {time.perf_counter() - t_knn:.2f}s")
+
+    # Phase 2: UMAP layout (sequential)
     fig, axes = plt.subplots(n_rows, n_cols, figsize=(7 * n_cols, 6 * n_rows))
     if n_panels == 1:
         axes = np.array([axes])
@@ -302,14 +403,16 @@ def main():
 
     sil_umap_results = {}
     for ax_i, (title, data, lb_key) in enumerate(panels):
-        print(f"Computing UMAP for {title}...")
-        reducer = umap.UMAP(n_neighbors=args.umap_neighbors, min_dist=0.3,
-                            metric='euclidean', random_state=42)
-        embedding = reducer.fit_transform(data)
+        t_start = time.perf_counter()
+        pre = precomputed.get(lb_key)
+        print(f"Fitting UMAP for {title}...")
+        embedding = _fit_umap(
+            (title, data, lb_key, args.umap_neighbors, pre))
+        print(f"  done in {time.perf_counter() - t_start:.2f}s")
 
-        # Silhouette score in 2D UMAP space
-        sil_2d = silhouette_score(embedding, states_sub)
-        sil_umap_results[lb_key] = sil_2d
+        if not args.no_sil:
+            sil_2d = gpu_silhouette_score(embedding, states_sub)
+            sil_umap_results[lb_key] = sil_2d
 
         ax = axes[ax_i]
         sc = ax.scatter(embedding[:, 0], embedding[:, 1], c=states_sub,
@@ -317,22 +420,24 @@ def main():
         ax.set_xlabel('UMAP 1')
         ax.set_ylabel('UMAP 2')
 
-        # Add LB and silhouette (UMAP 2D) info to title
         subtitle_parts = []
         if lb_key in lb_results:
             lb30 = lb_results[lb_key].get(30, None)
             if lb30 is not None:
                 subtitle_parts.append(f'LB={lb30:.1f}')
-        subtitle_parts.append(f'Sil={sil_2d:.3f}')
-        title += f'  ({", ".join(subtitle_parts)})'
+        if lb_key in sil_umap_results:
+            subtitle_parts.append(f'Sil={sil_umap_results[lb_key]:.3f}')
+        if subtitle_parts:
+            title += f'  ({", ".join(subtitle_parts)})'
         ax.set_title(title, fontsize=12)
         ax.grid(True, alpha=0.2)
 
-    print(f"\nSilhouette scores in UMAP 2D space:")
-    for key in selected_keys:
-        if key in sil_umap_results:
-            label = key.replace('_', ' ').title()
-            print(f"  {label}:  {sil_umap_results[key]:.4f}")
+    if sil_umap_results:
+        print(f"\nSilhouette scores in UMAP 2D space:")
+        for key in selected_keys:
+            if key in sil_umap_results:
+                label = key.replace('_', ' ').title()
+                print(f"  {label}:  {sil_umap_results[key]:.4f}")
 
     # Colourbar on the last used panel
     cbar = plt.colorbar(sc, ax=axes[len(panels) - 1], label='Circle index')
