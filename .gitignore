@@ -14,8 +14,7 @@ venv/
 
 # Generated images
 *.png
-!representation_umap_jepa_model.png
-!representation_umap_bert_model.png
+!representation_umap_*.png
 
 # Data
 data/
