@@ -220,25 +220,15 @@ class JEPATimeSeriesModel(nn.Module):
         for p in self.target_encoder.parameters():
             p.requires_grad = False
 
-        # Information bottleneck (applied to both encoder paths)
+        # Information bottleneck (context path only — target stays unconstrained)
         if bottleneck_dim > 0:
             self.context_bottleneck = nn.Sequential(
                 nn.Linear(d_model, bottleneck_dim),
                 nn.ReLU(),
                 nn.Linear(bottleneck_dim, d_model),
             )
-            self.target_bottleneck = nn.Sequential(
-                nn.Linear(d_model, bottleneck_dim),
-                nn.ReLU(),
-                nn.Linear(bottleneck_dim, d_model),
-            )
-            self.target_bottleneck.load_state_dict(
-                self.context_bottleneck.state_dict())
-            for p in self.target_bottleneck.parameters():
-                p.requires_grad = False
         else:
             self.context_bottleneck = None
-            self.target_bottleneck = None
 
         # Predictor (lightweight — deliberately shallower than the encoder)
         self.predictor = JEPAPredictor(
@@ -266,8 +256,6 @@ class JEPATimeSeriesModel(nn.Module):
         # Target path: full input, no gradients
         with torch.no_grad():
             target_reps = self.target_encoder(x)
-            if self.target_bottleneck is not None:
-                target_reps = self.target_bottleneck(target_reps)
 
         # Predictor: map context reps → predicted target reps at masked positions
         pred_reps = self.predictor(context_reps, mask)
@@ -280,29 +268,18 @@ class JEPATimeSeriesModel(nn.Module):
         for p_ctx, p_tgt in zip(self.context_encoder.parameters(),
                                 self.target_encoder.parameters()):
             p_tgt.data.mul_(momentum).add_(p_ctx.data, alpha=1.0 - momentum)
-        if self.context_bottleneck is not None:
-            for p_ctx, p_tgt in zip(self.context_bottleneck.parameters(),
-                                    self.target_bottleneck.parameters()):
-                p_tgt.data.mul_(momentum).add_(p_ctx.data, alpha=1.0 - momentum)
 
     @torch.no_grad()
     def encode(self, x):
         """Run input through the target encoder (no masking) and return
         per-layer representations.  Compatible with evaluate_representations.py.
 
-        When a bottleneck is active, the final layer's output is passed
-        through the target bottleneck so UMAP shows the compressed
-        representations.
-
         Returns
         -------
         layer_outputs : list of (batch, seq_len, d_model) tensors,
             one per transformer layer.
         """
-        outputs = self.target_encoder.forward_layers(x)
-        if self.target_bottleneck is not None:
-            outputs[-1] = self.target_bottleneck(outputs[-1])
-        return outputs
+        return self.target_encoder.forward_layers(x)
 
 
 # ---------------------------------------------------------------------------
@@ -498,16 +475,16 @@ def main():
                     'synthetic-song data.  (GPU-optimised)')
     # Data
     parser.add_argument('--data-dir', type=str, default='data')
-    parser.add_argument('--seq-len', type=int, default=512)
+    parser.add_argument('--seq-len', type=int, default=1000)
     parser.add_argument('--stride', type=int, default=128)
-    parser.add_argument('--mask-ratio', type=float, default=0.15)
+    parser.add_argument('--mask-ratio', type=float, default=0.5)
     parser.add_argument('--mask-patch-size', type=int, default=16)
-    parser.add_argument('--mask-patch-min', type=int, default=16)
-    parser.add_argument('--mask-patch-max', type=int, default=256)
+    parser.add_argument('--mask-patch-min', type=int, default=10)
+    parser.add_argument('--mask-patch-max', type=int, default=600)
     # Model (encoder)
     parser.add_argument('--d-model', type=int, default=128)
     parser.add_argument('--n-heads', type=int, default=4)
-    parser.add_argument('--n-layers', type=int, default=4,
+    parser.add_argument('--n-layers', type=int, default=8,
                         help='Transformer layers in each encoder')
     parser.add_argument('--d-ff', type=int, default=512)
     parser.add_argument('--dropout', type=float, default=0.1)
@@ -533,7 +510,7 @@ def main():
     parser.add_argument('--batch-size', type=int, default=128)
     parser.add_argument('--lr', type=float, default=3e-4)
     parser.add_argument('--warmup-epochs', type=int, default=20)
-    parser.add_argument('--epochs', type=int, default=1000)
+    parser.add_argument('--epochs', type=int, default=500)
     parser.add_argument('--val-fraction', type=float, default=0.1)
     parser.add_argument('--num-workers', type=int, default=4)
     # GPU options

@@ -696,6 +696,10 @@ if __name__ == '__main__':
     parser.add_argument('--drift-rate', type=float, default=0.5,
                         help='Max tilt angle in radians over the full '
                              'time series (default: 0.5 ≈ 29°)')
+    parser.add_argument('--noise-scale', type=float, default=1.0,
+                        help='Multiplier for observation noise_std '
+                             '(default 1.0 → noise_std=2.83, '
+                             'use 10 for high-noise regime)')
     args = parser.parse_args()
     if args.subspace_dim is not None:
         DEFAULT_CONFIG['subspace_dim'] = args.subspace_dim
@@ -704,4 +708,5 @@ if __name__ == '__main__':
     if args.drift:
         DEFAULT_CONFIG['drift'] = True
         DEFAULT_CONFIG['drift_rate'] = args.drift_rate
+    DEFAULT_CONFIG['noise_std'] *= args.noise_scale
     main(run_umap=not args.no_umap)

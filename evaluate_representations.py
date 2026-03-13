@@ -225,10 +225,14 @@ def main():
                         help='Max points for UMAP (subsampled if larger)')
     parser.add_argument('--umap-neighbors', type=int, default=50,
                         help='UMAP n_neighbors parameter')
-    parser.add_argument('--no-lb', action='store_true',
-                        help='Skip Levina-Bickel dimension estimates')
-    parser.add_argument('--no-sil', action='store_true',
-                        help='Skip silhouette score computation')
+    parser.add_argument('--no-lb', action='store_true', default=True,
+                        help='Skip Levina-Bickel dimension estimates (default)')
+    parser.add_argument('--lb', action='store_true',
+                        help='Compute Levina-Bickel dimension estimates')
+    parser.add_argument('--no-sil', action='store_true', default=True,
+                        help='Skip silhouette score computation (default)')
+    parser.add_argument('--sil', action='store_true',
+                        help='Compute silhouette scores')
     parser.add_argument('--lb-points', type=int, default=2000,
                         help='Points to subsample for Levina-Bickel')
     parser.add_argument('--layers', type=str, default=None,
@@ -238,6 +242,10 @@ def main():
                              'projection.  E.g. --layers input,4,7,output. '
                              'Default: all layers.')
     args = parser.parse_args()
+    if args.lb:
+        args.no_lb = False
+    if args.sil:
+        args.no_sil = False
 
     device = torch.device(
         'cuda' if torch.cuda.is_available() else
