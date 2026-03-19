@@ -155,43 +155,67 @@ source venv/bin/activate
 pip install numpy matplotlib torch scipy umap-learn
 ```
 
-## Usage
+## Reproducing results
 
-### Generate dataset
+### Result 1: Depth scaling on noisy data
+
+Generate the noisy dataset, then train both models. JEPA defaults (8L encoder, 2L predictor, d_model=128, 50% masking, patches 10–600, seq 1000, batch 128) match the reported config — only `--epochs` and `--n-layers` need overriding.
 
 ```bash
-# High-noise regime (noise_std ≈ 5, where JEPA outshines BERT)
+# Generate noisy dataset (noise_std ≈ 5)
 python markov_circles_timeseries.py --subspace-dim 4 --drift --noise-scale 1.77 --no-umap
 
-# Random walk + moderate noise
-python markov_circles_timeseries.py --subspace-dim 4 --random-walk \
-    --walk-drift-rate 0.60 --noise-scale 1.5 --no-umap
-```
+# JEPA 8L (default depth)
+python jepa_model_gpu.py --epochs 1000 --checkpoint jepa_model_noisy5.pt
 
-### Train
+# JEPA 6L / 12L
+python jepa_model_gpu.py --epochs 1000 --n-layers 6 --checkpoint jepa_model_noisy5_6L.pt
+python jepa_model_gpu.py --epochs 1000 --n-layers 12 --checkpoint jepa_model_noisy5_12L.pt
 
-```bash
-# JEPA (default: 8L encoder, 2L predictor, 50% masking, seq 1000)
-python jepa_model_gpu.py --epochs 1000 --checkpoint jepa_model.pt
-
-# JEPA with effective rank tracking
-python jepa_model_erank.py --epochs 1000 --checkpoint jepa_model_erank.pt
-
-# BERT (matching JEPA's encoder config)
+# BERT 8L (BERT defaults differ, so all params must be specified)
+cp data/*.npy ../synthetic-bert/data/
 cd ../synthetic-bert
 python masked_model_gpu.py --seq-len 1000 --mask-ratio 0.5 \
     --mask-patch-min 10 --mask-patch-max 600 --n-layers 8 \
-    --epochs 1000 --pos-encoding rope --checkpoint bert_model.pt
+    --epochs 1000 --pos-encoding rope --checkpoint bert_model_noisy5.pt
+
+# BERT 6L / 12L
+python masked_model_gpu.py --seq-len 1000 --mask-ratio 0.5 \
+    --mask-patch-min 10 --mask-patch-max 600 --n-layers 6 \
+    --epochs 1000 --pos-encoding rope --checkpoint bert_model_noisy5_6L.pt
+python masked_model_gpu.py --seq-len 1000 --mask-ratio 0.5 \
+    --mask-patch-min 10 --mask-patch-max 600 --n-layers 12 \
+    --epochs 1000 --pos-encoding rope --checkpoint bert_model_noisy5_12L.pt
 ```
 
-### Evaluate representations
+### Result 2: Effective rank
+
+```bash
+# Generate random walk + noise dataset
+python markov_circles_timeseries.py --subspace-dim 4 --random-walk \
+    --walk-drift-rate 0.60 --noise-scale 1.5 --no-umap
+
+# JEPA with effective rank tracking
+python jepa_model_erank.py --epochs 1000 --checkpoint jepa_model_erank_rw60_noisy15.pt
+
+# BERT with effective rank tracking
+cp data/*.npy ../synthetic-bert/data/
+cd ../synthetic-bert
+python masked_model_erank.py --seq-len 1000 --mask-ratio 0.5 \
+    --mask-patch-min 10 --mask-patch-max 600 --n-layers 8 \
+    --epochs 1000 --pos-encoding rope --checkpoint bert_model_erank_rw60_noisy15.pt
+```
+
+### Evaluate representations (UMAP)
 
 ```bash
 # UMAP + silhouette scores
-python evaluate_representations.py --checkpoint jepa_model.pt --sil
+python evaluate_representations.py --checkpoint jepa_model_noisy5.pt \
+    --output-prefix jepa_model_noisy5 --sil
 
 # UMAP only (faster)
-python evaluate_representations.py --checkpoint jepa_model.pt
+python evaluate_representations.py --checkpoint jepa_model_noisy5.pt \
+    --output-prefix jepa_model_noisy5
 ```
 
 ## Files

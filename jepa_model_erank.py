@@ -592,7 +592,7 @@ def main():
     parser.add_argument('--batch-size', type=int, default=128)
     parser.add_argument('--lr', type=float, default=3e-4)
     parser.add_argument('--warmup-epochs', type=int, default=20)
-    parser.add_argument('--epochs', type=int, default=500)
+    parser.add_argument('--epochs', type=int, default=1000)
     parser.add_argument('--val-fraction', type=float, default=0.1)
     parser.add_argument('--num-workers', type=int, default=4)
     # GPU options
