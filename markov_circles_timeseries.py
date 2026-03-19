@@ -209,6 +209,8 @@ def generate_time_series(
     subspace_dim=None,
     drift=False,
     drift_rate=0.5,
+    random_walk=False,
+    walk_drift_rate=0.30,
     seed=42,
 ):
     """
@@ -258,6 +260,13 @@ def generate_time_series(
     drift_rate : float
         Maximum tilt angle in radians over one syllable.
         Default 0.5 rad ≈ 29°.
+    random_walk : bool
+        If True, each syllable undergoes independent random walks in
+        plane tilt and radius.  Both reset at each new visit.
+    walk_drift_rate : float
+        Expected fractional change (RMS) over ``dwell_mean`` steps.
+        Default 0.30 means ~30% radius change and ~0.30 rad tilt
+        after a typical visit.  Per-step σ = walk_drift_rate / √dwell_mean.
     seed : int
         Random seed for reproducibility.
 
@@ -313,6 +322,31 @@ def generate_time_series(
         v2_new /= np.linalg.norm(v2_new)
         return v1_new, v2_new
 
+    # Random walk setup: tilt axis for every circle
+    walk_tilt_axes = {}
+    walk_sigma = 0.0
+    if random_walk:
+        walk_sigma = walk_drift_rate / np.sqrt(max(1, dwell_mean))
+        for i in range(n_circles):
+            v1, v2 = planes[i]
+            d = rng.standard_normal(ambient_dim)
+            d -= d.dot(v1) * v1
+            d -= d.dot(v2) * v2
+            d /= np.linalg.norm(d)
+            walk_tilt_axes[i] = d
+
+    def _get_walked_plane(circle_idx, tilt_angle):
+        """Return a plane tilted by *tilt_angle* radians from the base."""
+        v1, v2 = planes[circle_idx]
+        if abs(tilt_angle) < 1e-10:
+            return v1, v2
+        d = walk_tilt_axes[circle_idx]
+        v1_new = np.cos(tilt_angle) * v1 + np.sin(tilt_angle) * d
+        v1_new /= np.linalg.norm(v1_new)
+        v2_new = v2 - v2.dot(v1_new) * v1_new
+        v2_new /= np.linalg.norm(v2_new)
+        return v1_new, v2_new
+
     # Allocate output arrays
     X = np.zeros((n_steps, ambient_dim))
     states = np.zeros(n_steps, dtype=int)
@@ -332,15 +366,29 @@ def generate_time_series(
         dwell = n_revs * period                   # exact multiple → same exit angle
         dwell = min(dwell, n_steps - t)            # don't overshoot
 
+        # Random walk state for this syllable (resets each visit)
+        rw_tilt = 0.0
+        rw_radius_factor = 1.0
+
         for s in range(dwell):
+            if random_walk:
+                rw_tilt += rng.normal(0, walk_sigma)
+                rw_radius_factor += rng.normal(0, walk_sigma)
+
             angle = entry + s * omega
             states[t] = current_circle
             thetas[t] = angle % (2 * np.pi)
 
-            plane = _get_plane(current_circle, s, dwell)
+            if random_walk:
+                plane = _get_walked_plane(current_circle, rw_tilt)
+                r = radii[current_circle] * max(0.1, rw_radius_factor)
+            else:
+                plane = _get_plane(current_circle, s, dwell)
+                r = radii[current_circle]
+
             pos = point_on_circle(
                 thetas[t],
-                radii[current_circle],
+                r,
                 plane,
                 centers[current_circle],
             )
@@ -424,6 +472,8 @@ DEFAULT_CONFIG = dict(
     subspace_dim=None,
     drift=False,
     drift_rate=0.5,
+    random_walk=False,
+    walk_drift_rate=0.30,
     seed=42,
 )
 
@@ -606,7 +656,13 @@ def main(run_umap=True):
                 seg_mid = (seg_start + t) / 2
                 ci = states[seg_start]
                 is_drift = config.get('drift', False) and ci % 2 == 0
-                label = f'{ci}D' if is_drift else str(ci)
+                is_walk = config.get('random_walk', False)
+                if is_walk:
+                    label = f'{ci}W'
+                elif is_drift:
+                    label = f'{ci}D'
+                else:
+                    label = str(ci)
                 ax_top.text(seg_mid, 0.5, label, ha='center', va='center',
                             fontsize=7, fontweight='bold', color='white',
                             transform=ax_top.get_xaxis_transform())
@@ -700,6 +756,12 @@ if __name__ == '__main__':
                         help='Multiplier for observation noise_std '
                              '(default 1.0 → noise_std=2.83, '
                              'use 10 for high-noise regime)')
+    parser.add_argument('--random-walk', action='store_true',
+                        help='Enable per-syllable random walk in plane '
+                             'tilt and radius for all circles')
+    parser.add_argument('--walk-drift-rate', type=float, default=0.30,
+                        help='Expected fractional change (RMS) over '
+                             'dwell_mean steps (default: 0.30 = 30%%)')
     args = parser.parse_args()
     if args.subspace_dim is not None:
         DEFAULT_CONFIG['subspace_dim'] = args.subspace_dim
@@ -708,5 +770,8 @@ if __name__ == '__main__':
     if args.drift:
         DEFAULT_CONFIG['drift'] = True
         DEFAULT_CONFIG['drift_rate'] = args.drift_rate
+    if args.random_walk:
+        DEFAULT_CONFIG['random_walk'] = True
+        DEFAULT_CONFIG['walk_drift_rate'] = args.walk_drift_rate
     DEFAULT_CONFIG['noise_std'] *= args.noise_scale
     main(run_umap=not args.no_umap)
